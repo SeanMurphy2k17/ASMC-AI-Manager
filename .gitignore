@@ -1,0 +1,25 @@
+# Model files (tens of GB; downloaded separately, see README)
+models/
+*.gguf
+
+# Memory: the ASMC store, journal and mood this server keeps. Private, local only.
+memory/
+memory.*/
+MemoryStructures/
+
+# Runtime
+logs/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Dated backups written beside a file before it was changed
+*.orig-20*
+*.bak-20*
+
+# Local notes
+MEMORY_MOVED.md
+
+# Machine-specific settings (see README)
+local_settings.json

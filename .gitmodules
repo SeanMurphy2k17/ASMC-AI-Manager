@@ -1,0 +1,3 @@
+[submodule "asmc"]
+	path = asmc
+	url = https://github.com/SeanMurphy2k17/AdvancedSemanticMemoryClustering-ASMC.git
