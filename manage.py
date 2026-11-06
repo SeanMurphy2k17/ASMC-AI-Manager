@@ -988,6 +988,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 app = FastAPI()
 
+_background_writes = set()  # keeps memory-write tasks referenced until they finish
+
 
 # --- smart loader: tiny CPU router picks a variant per request -----------
 
@@ -1428,18 +1430,17 @@ async def chat_completions(request: Request):
         )
 
     async def stream_and_capture():
-        # Each round is buffered (not forwarded live) until it's clear
-        # whether it ended in a pure round of OUR tool calls -- if so,
-        # nothing from it was ever shown to the client, we execute the
-        # tools and continue silently. Otherwise the whole round is
-        # replayed to the client as a block. Deliberate tradeoff: normal
-        # (non-tool) turns lose token-by-token live delivery in exchange for
-        # tool-call rounds never leaking raw tool_calls deltas to a client
-        # that never defined these tools and wouldn't know what to do with
-        # them.
+        # Text and reasoning go to the client token by token as they arrive.
+        # Only tool calls are held back: from the first tool_calls delta to
+        # the end of the round, chunks wait until it's clear whether the round
+        # was a pure round of OUR tool calls. If so they are dropped, we
+        # execute the tools and continue, so raw tool_calls deltas never reach
+        # a client that never defined these tools. Otherwise they are sent.
+        # What is remembered is what the client was shown.
         full_text, total_len, last_checked_len = [], 0, 0
         full_reasoning = []
         completion_id, created = None, None
+        role_sent = False
         continuations_used = 0
         tool_rounds = 0
         extra_messages = []  # accumulated tool-call/tool-result pairs so far
@@ -1448,12 +1449,9 @@ async def chat_completions(request: Request):
         try:
             while True:
                 loop_pattern = None
-                round_chunks = []
-                round_text_parts = []
-                round_reasoning_parts = []
+                held_chunks = []
                 tool_call_parts = {}
                 finish_reason = None
-                round_len = 0
 
                 async for line in current_resp.aiter_lines():
                     if not line or not line.startswith("data: "):
@@ -1474,16 +1472,8 @@ async def chat_completions(request: Request):
                         if created is not None:
                             chunk["created"] = created
 
-                    round_chunks.append(chunk)
                     choices = chunk.get("choices") or [{}]
                     delta = choices[0].get("delta", {})
-                    piece = delta.get("content")
-                    if piece:
-                        round_text_parts.append(piece)
-                        round_len += len(piece)
-                    rpiece = delta.get("reasoning_content")
-                    if rpiece:
-                        round_reasoning_parts.append(rpiece)
                     for tc_delta in delta.get("tool_calls") or []:
                         idx = tc_delta.get("index", 0)
                         slot = tool_call_parts.setdefault(idx, {"id": None, "name": None, "arguments": ""})
@@ -1497,10 +1487,29 @@ async def chat_completions(request: Request):
                     if choices[0].get("finish_reason"):
                         finish_reason = choices[0]["finish_reason"]
 
+                    if tool_call_parts or finish_reason == "tool_calls":
+                        held_chunks.append(chunk)
+                        continue
+
+                    piece = delta.get("content")
+                    rpiece = delta.get("reasoning_content")
+                    if piece:
+                        full_text.append(piece)
+                        total_len += len(piece)
+                    if rpiece:
+                        full_reasoning.append(rpiece)
+                    # A later round's opening chunk says "assistant" again; the
+                    # client already has one message open.
+                    if role_sent:
+                        delta.pop("role", None)
+                    if piece or rpiece or not role_sent or choices[0].get("finish_reason") or not chunk.get("choices"):
+                        role_sent = True
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
                     if (piece and continuations_used < REPETITION_MAX_CONTINUATIONS
-                            and total_len + round_len - last_checked_len >= REPETITION_CHECK_INTERVAL):
-                        last_checked_len = total_len + round_len
-                        loop_pattern = detect_repetition("".join(full_text) + "".join(round_text_parts))
+                            and total_len - last_checked_len >= REPETITION_CHECK_INTERVAL):
+                        last_checked_len = total_len
+                        loop_pattern = detect_repetition("".join(full_text))
                         if loop_pattern:
                             break
 
@@ -1546,15 +1555,16 @@ async def chat_completions(request: Request):
                         break
                     continue
 
-                # Not a (pure) tool round -- first point anything from this
-                # round is actually shown to the client, replayed as a block.
-                for chunk in round_chunks:
+                # Not a (pure) tool round: whatever was held belongs to the client.
+                for chunk in held_chunks:
+                    delta = (chunk.get("choices") or [{}])[0].get("delta", {})
+                    if delta.get("content"):
+                        full_text.append(delta["content"])
+                        total_len += len(delta["content"])
+                    if delta.get("reasoning_content"):
+                        full_reasoning.append(delta["reasoning_content"])
+                    role_sent = True
                     yield f"data: {json.dumps(chunk)}\n\n"
-                if round_text_parts:
-                    full_text.append("".join(round_text_parts))
-                if round_reasoning_parts:
-                    full_reasoning.append("".join(round_reasoning_parts))
-                total_len += round_len
                 last_checked_len = total_len
 
                 if not loop_pattern:
@@ -1584,10 +1594,20 @@ async def chat_completions(request: Request):
                     await current_client.aclose()
                     break
         finally:
-            await client.aclose()
+            # A client that stops mid-answer lands here with this request being
+            # cancelled, so any await below can be interrupted. The memory write
+            # is its own task, started first, so it survives that; closing the
+            # response stops the backend generating for nobody.
             reply = "".join(full_text).strip()
             if reply:
-                await asyncio.to_thread(remember, user_query, reply, "".join(full_reasoning))
+                task = asyncio.create_task(
+                    asyncio.to_thread(remember, user_query, reply, "".join(full_reasoning))
+                )
+                _background_writes.add(task)
+                task.add_done_callback(_background_writes.discard)
+            await current_resp.aclose()
+            await current_client.aclose()
+            await client.aclose()
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_and_capture(), media_type="text/event-stream")
