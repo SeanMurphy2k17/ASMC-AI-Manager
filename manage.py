@@ -202,6 +202,13 @@ VARIANTS = {
 # with every VARIANTS entry on a single GPU -- Qwen3.8-Flash-Next alone fills
 # nearly the whole card, so running it and a local variant at once will OOM
 # whichever loads second. Select it explicitly with `manage.py start flash`.
+# Basalt's locations (machine-specific: set them in the environment or local_settings.json).
+# BASALT_BIN is the built `bin/basalt`; BASALT_PACK the .basalt model pack; BASALT_VENV the
+# Python venv its server needs (installed from basalt's requirements.txt).
+BASALT_BIN = os.environ.get("BASALT_BIN") or os.path.expanduser("~/basalt/bin/basalt")
+BASALT_PACK = os.environ.get("BASALT_PACK") or os.path.join(MODELS_DIR, "Qwen3.8-FN-UD-IQ3_XXS.basalt")
+BASALT_VENV = os.environ.get("BASALT_VENV") or os.path.expanduser("~/venvs/basalt")
+
 EXTERNAL_VARIANTS = {
     "flash": {
         "label": "Qwen3.8-Flash-Next (UD-IQ4_XS, ~180B/10-of-512 MoE + MTP) (strata)",
@@ -230,6 +237,39 @@ EXTERNAL_VARIANTS = {
         # Used by unload_external() -- run on every Ctrl+C / `stop` unless a
         # restart of this same variant (or `stop --keep-warm`) says to keep it.
         "stop_args": ["launch", "--stop"],
+    },
+    # Basalt (github.com/jesdga95/basalt, an MIT fork of Strata tuned for
+    # Blackwell), built in ~/basalt. Same model family as "flash" but Unsloth's
+    # UD-IQ3_XXS pack. Measured on this laptop 2026-11-23, cold start, temp 0:
+    # prose 115 t/s, code 148, JSON 178; 16K prompt read in 5.9 s; 20.4 GiB on
+    # the GPU + 31.3 GiB RAM, n-gram table read from the SSD. Basalt has no
+    # `launch --stop`, so manage.py owns the process: started in its own
+    # session, its PID kept in "pidfile", stopped by signalling that group.
+    # Port 8081 so its /health can never be mistaken for Strata's on 8080.
+    # --alias basalt, and "served_model" makes manage.py forward {"model": "basalt"}
+    # whatever name the client sent: unlike Strata and llama.cpp, Basalt refuses an
+    # unknown model name with a 404 (model_not_found).
+    "basalt": {
+        "label": "Qwen3.8-Flash-Next (UD-IQ3_XXS, MTP drafting) (basalt)",
+        "engine": "basalt",
+        "served_model": "basalt",
+        "base_url": "http://127.0.0.1:8081",
+        "context": 131072,
+        "launch_cmd": [
+            BASALT_BIN, "serve",
+            "--model", BASALT_PACK,
+            "--alias", "basalt",
+            "--max-context", str(TOTAL_CONTEXT), "--kv", "int8",
+            # The pack carries its own vision encoder (vision/mmproj). "dynamic"
+            # borrows expert-cache slots only while reading an image: no standing VRAM.
+            "--vision", "dynamic",
+            "--host", "127.0.0.1", "--port", "8081",
+        ],
+        "launch_cwd": os.path.dirname(os.path.dirname(BASALT_BIN)),
+        # basalt's server is Python: it needs its own venv (jinja2 etc.) first on PATH.
+        "launch_path_prepend": os.path.join(BASALT_VENV, "bin"),
+        "pidfile": os.path.join(os.path.dirname(os.path.abspath(__file__)), "basalt.pid"),
+        "log": os.path.join(os.path.dirname(os.path.abspath(__file__)), "basalt.log"),
     },
 }
 
@@ -442,6 +482,30 @@ def launch_external(key):
     if external_health_ok(key):
         print(f"'{key}' ({cfg['label']}) is already up at {cfg['base_url']} -- reusing it.")
         return
+    if cfg.get("launch_cmd"):
+        # A server that stays in the foreground (basalt serve): we own it.
+        # Its own session, so our Ctrl+C doesn't reach it; unload_external()
+        # stops it through the PID written here.
+        cmd = list(cfg["launch_cmd"])
+        env = dict(os.environ)
+        if cfg.get("launch_path_prepend"):
+            env["PATH"] = cfg["launch_path_prepend"] + os.pathsep + env.get("PATH", "")
+        print(f"'{key}' isn't running yet -- launching it (log: {cfg['log']}): {' '.join(cmd)}")
+        logf = open(cfg["log"], "ab")
+        proc = subprocess.Popen(cmd, cwd=cfg.get("launch_cwd"), env=env, stdout=logf,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        with open(cfg["pidfile"], "w") as f:
+            f.write(str(proc.pid))
+        for _ in range(600):
+            time.sleep(1)
+            if proc.poll() is not None:
+                raise RuntimeError(f"Launching '{key}' exited early (code {proc.returncode}); "
+                                   f"see {cfg['log']}.")
+            if external_health_ok(key):
+                print(f"'{key}' ready at {cfg['base_url']} (it loads the model on the first "
+                      f"request, ~15-30 s).")
+                return
+        raise RuntimeError(f"'{key}' did not come up after 600s; see {cfg['log']}.")
     cmd = [STRATA_BIN, "launch", *cfg.get("launch_args", [])]
     print(f"'{key}' isn't running yet -- launching it (this can take a while for a model "
           f"this size): {' '.join(cmd)}")
@@ -456,6 +520,60 @@ def launch_external(key):
     raise RuntimeError(f"'{key}' did not come up after 600s.")
 
 
+def _unload_pidfile_external(key, cfg, quiet=False):
+    """Stop a server launch_external() started itself (basalt): SIGTERM to its
+    process group, SIGKILL after 30 s if it is still there. Only the exact PID
+    from its pidfile, and only if that process is still the one we launched."""
+    try:
+        with open(cfg["pidfile"]) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    # bin/basalt execs `python3 -m serve.server --engine-bin ... --model <pack>` under the same PID,
+    # so the program name changes; the model path stays in the command line either way.
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read().split(b"\0")
+        ours = cfg["launch_cmd"][cfg["launch_cmd"].index("--model") + 1].encode() in argv
+    except (OSError, ValueError):
+        ours = False
+    if not ours:
+        os.remove(cfg["pidfile"])  # gone, or the PID now belongs to something else
+        return
+    if not quiet:
+        print(f"Unloading '{key}' ({cfg['label']})...")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    def _gone():
+        # When this process launched it, the exited server stays a zombie until reaped.
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+        except OSError:
+            return True
+    for _ in range(30):
+        if _gone():
+            break
+        time.sleep(1)
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.remove(cfg["pidfile"])
+    except OSError:
+        pass
+    if not quiet:
+        print(f"Unloaded '{key}'.")
+
+
 def unload_external(quiet=False):
     """Shut down any running EXTERNAL_VARIANTS server (frees its VRAM).
     Called from _shutdown() on every Ctrl+C / `stop` so no stray model is
@@ -464,6 +582,9 @@ def unload_external(quiet=False):
     same variant is about to be reused (restart) or `stop --keep-warm` was
     asked for. Idempotent: does nothing for a server that isn't answering."""
     for key, cfg in EXTERNAL_VARIANTS.items():
+        if cfg.get("pidfile"):
+            _unload_pidfile_external(key, cfg, quiet)
+            continue
         if not cfg.get("stop_args") or not external_health_ok(key):
             continue
         if not quiet:
@@ -1179,7 +1300,8 @@ async def list_models():
         {"id": key, "object": "model", "created": now, "owned_by": "llama.cpp"}
         for key in VARIANTS
     ] + [
-        {"id": key, "object": "model", "created": now, "owned_by": "strata"}
+        {"id": key, "object": "model", "created": now,
+         "owned_by": EXTERNAL_VARIANTS[key].get("engine", "strata")}
         for key in EXTERNAL_VARIANTS
     ]
     return JSONResponse({"object": "list", "data": data})
@@ -1312,6 +1434,10 @@ async def chat_completions(request: Request):
     # either way, so everything below (repetition detection, streaming,
     # memory storage) works unmodified, just pointed at a different URL.
     backend_url = EXTERNAL_VARIANTS[backend_state.key]["base_url"] if backend_state.is_external else BACKEND_BASE_URL
+    # A server that checks the model name (Basalt) gets the name it serves under,
+    # not whatever the client's own model list sent (e.g. VS Code's configured id).
+    if backend_state.is_external and EXTERNAL_VARIANTS[backend_state.key].get("served_model"):
+        body["model"] = EXTERNAL_VARIANTS[backend_state.key]["served_model"]
     # Memory tools (journal_write/recall/set_mood) are always on for the
     # local/external path -- see the module note above for why remote is
     # excluded. Harmless if the active model doesn't actually support tool
@@ -1857,7 +1983,7 @@ def start(key, n_agents=1, detach=False, router_enabled=True, confirmed=False, m
 
     if is_external:
         cfg = EXTERNAL_VARIANTS[key]
-        print(f"'{key}' ({cfg['label']}) uses its own engine (strata) under the hood -- "
+        print(f"'{key}' ({cfg['label']}) uses its own engine ({cfg.get('engine', 'strata')}) under the hood -- "
               f"never something Proteus can pick on its own. Launching it if it isn't "
               f"already up at {cfg['base_url']} (reused as-is if it already is).")
 

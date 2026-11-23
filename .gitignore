@@ -23,3 +23,8 @@ MEMORY_MOVED.md
 
 # Machine-specific settings (see README)
 local_settings.json
+
+# Runtime files of a manage.py-launched engine, and dated backups
+*.pid
+basalt.log
+*.before-*

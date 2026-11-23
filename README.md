@@ -83,6 +83,7 @@ wins over the file.
 | `ANTHROPIC_API_KEY`, `CLAUDE_REMOTE_MODEL` | unset, `claude-sonnet-5-5` | The `claude` remote variant. |
 | `OPENAI_API_KEY`, `OPENAI_REMOTE_MODEL` | unset, `gpt-5` | The `openai` remote variant. |
 | `QWEN_REMOTE_API_KEY`, `QWEN_REMOTE_MODEL`, `QWEN_REMOTE_BASE_URL` | unset, `qwen-max`, DashScope | The `qwen-remote` variant (any OpenAI-compatible endpoint). |
+| `BASALT_BIN`, `BASALT_PACK`, `BASALT_VENV` | `~/basalt/bin/basalt`, `models/Qwen3.8-FN-UD-IQ3_XXS.basalt`, `~/venvs/basalt` | The `basalt` external variant: the built engine, its model pack, and the venv its server runs in. |
 
 Ports and the context budget are constants near the top of `manage.py`: `PUBLIC_PORT` (18090),
 `BACKEND_PORT` (18080), `ROUTER_PORT` (18070) and `TOTAL_CONTEXT` (131072).
@@ -118,6 +119,13 @@ Two more kinds of variant sit beside the local ones:
   Qwen3.8-Flash-Next with Strata on :8080). `manage.py` starts it if it is not running and
   unloads it on exit unless asked to keep it warm. It is never in Proteus's pool, since it needs
   the whole GPU.
+  A second entry, `basalt`, runs the same model family on [Basalt](https://github.com/jesdga95/basalt)
+  (an MIT fork of Strata tuned for Blackwell GPUs) on :8081, with its built-in vision encoder.
+  `manage.py` owns that process: it starts it in its own session, keeps its PID, and stops it on
+  exit. Basalt only accepts its own model name, so requests are forwarded as `"model": "basalt"`
+  whatever name the client sends. On one RTX 5090 Laptop (24 GB) with Qwen3.8-Flash-Next
+  UD-IQ3_XXS at 32K context it wrote about 115–190 tokens/s against Strata's 74–114 on the same
+  machine.
 - **Remote** (`remote_apis.py`: `claude`, `openai`, `qwen-remote`): an outside API. These are
   chosen only with `manage.py start <key>`, which asks for confirmation and needs the API key.
   A request cannot switch to one by naming it, because the conversation, including anything
