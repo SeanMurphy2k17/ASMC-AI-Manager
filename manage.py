@@ -264,6 +264,13 @@ EXTERNAL_VARIANTS = {
             # borrows expert-cache slots only while reading an image: no standing VRAM.
             "--vision", "dynamic",
             "--host", "127.0.0.1", "--port", "8081",
+            # Coding clients ask for a large reply cap (64K). Late in a long
+            # conversation prompt + cap passes the context: shrink the cap to
+            # what is left instead of refusing the request with a 400.
+            "--fit-max-tokens",
+            # Qwen's thinking-mode sampling, for clients that send none (Basalt's
+            # own default is 1.0). Greedy (0) makes thinking models stall/loop.
+            "--temperature", "0.6", "--top-p", "0.95",
         ],
         "launch_cwd": os.path.dirname(os.path.dirname(BASALT_BIN)),
         # basalt's server is Python: it needs its own venv (jinja2 etc.) first on PATH.
@@ -875,9 +882,29 @@ def build_full_context(query: str) -> str | None:
 
 
 def inject_memory(messages: list[dict], memory_block: str | None) -> list[dict]:
+    """Attach the memory block to the newest user message.
+
+    It used to be appended to the system message, but the block changes with every
+    new prompt, and a change at the very start of the conversation throws away the
+    backend's prompt cache for everything after it: on a long coding session that
+    meant re-reading 80-100K tokens (20-30 s of silence) on every typed message.
+    Placed on the newest user message, the long shared prefix stays cached and only
+    the newest turn is read again. (Qwen's chat template accepts a system message
+    only at the start, so the block goes into the user message's own content.)"""
     if not memory_block:
         return messages
     augmented = list(messages)
+    for i in range(len(augmented) - 1, -1, -1):
+        if augmented[i].get("role") != "user":
+            continue
+        msg = dict(augmented[i])
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [{"type": "text", "text": memory_block}] + list(content)
+        else:
+            msg["content"] = f"{memory_block}\n\n{content or ''}".rstrip()
+        augmented[i] = msg
+        return augmented
     if augmented and augmented[0].get("role") == "system":
         merged = dict(augmented[0])
         merged["content"] = f"{merged.get('content', '')}\n\n{memory_block}".strip()
@@ -894,6 +921,31 @@ REPETITION_MIN_REPEATS = 3
 REPETITION_MAX_PATTERN_LEN = 3000
 REPETITION_CHECK_INTERVAL = 40
 REPETITION_MAX_CONTINUATIONS = 2
+# A thinking model sometimes announces a tool call ("Applying the edits now:")
+# and then ends its turn without making it; a coding client (VS Code) takes a
+# reply with no tool call as finished and stops. When the client offered tools,
+# the round made no call and its text ends in a colon, ask the backend to
+# continue and stream the rest into the same reply. At most this many per request.
+AUTO_CONTINUE_MAX = 2
+
+# A reply that ends by announcing its next step ("Applying the edits now:", "let me check the DB state.")
+# and then stops without a call is a stall, not a finished turn.  Read the last sentence of the reply.
+_ANNOUNCE_RE = re.compile(
+    r"\b(let me|let's|i'll|i will|i'm going to|i am going to|going to|now (?:i'll |i will )?(?:apply|write|run|check|"
+    r"read|fix|edit|creat|add|replac|patch|rebuild|verify|test|look|search|view|updat|implement|re-?run)\w*|"
+    r"(?:applying|writing|running|checking|reading|fixing|editing|creating|adding|replacing|patching|rebuilding|"
+    r"verifying|testing|updating|implementing|re-?running)\b.*\bnow|first,|next,|next:)", re.I)
+
+
+def announces_action(text):
+    """True when the reply's text stops on a lead-in to an action: empty, ending in a colon, or a last
+    sentence that says what it is about to do."""
+    t = (text or "").strip()
+    if not t or t.endswith(":"):
+        return True
+    last = re.split(r"(?<=[.!?])\s+", t)[-1].lower()
+    last = re.sub(r"let me know|(?:i'll|i will|let me|i'm going to) (?:stop|wait|pause|leave|hold)", "", last)
+    return bool(_ANNOUNCE_RE.search(last))
 
 
 def detect_repetition(text: str) -> str | None:
@@ -1571,11 +1623,18 @@ async def chat_completions(request: Request):
         tool_rounds = 0
         extra_messages = []  # accumulated tool-call/tool-result pairs so far
         current_resp, current_client = resp, client
+        finish_reason, tool_call_parts, stream_t0 = None, {}, time.time()
+        stream_usage = {}
+        auto_continues = 0
+        client_has_tools = any((t.get("function") or {}).get("name") not in MEMORY_TOOL_NAMES
+                               for t in body.get("tools") or [])
 
         try:
             while True:
                 loop_pattern = None
                 held_chunks = []
+                finish_chunks = []      # the round's closing chunks, sent only once no continuation follows
+                round_start = len(full_text)
                 tool_call_parts = {}
                 finish_reason = None
 
@@ -1612,9 +1671,16 @@ async def chat_completions(request: Request):
                             slot["arguments"] += fn["arguments"]
                     if choices[0].get("finish_reason"):
                         finish_reason = choices[0]["finish_reason"]
+                    if chunk.get("usage"):
+                        stream_usage = chunk["usage"]
 
                     if tool_call_parts or finish_reason == "tool_calls":
                         held_chunks.append(chunk)
+                        continue
+                    delta_now = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                    if (finish_reason or not chunk.get("choices")) and not delta_now.get("content") \
+                            and not delta_now.get("reasoning_content"):
+                        finish_chunks.append(chunk)
                         continue
 
                     piece = delta.get("content")
@@ -1693,7 +1759,41 @@ async def chat_completions(request: Request):
                     yield f"data: {json.dumps(chunk)}\n\n"
                 last_checked_len = total_len
 
+                round_text = "".join(full_text[round_start:])
+                if (not loop_pattern and not tool_call_parts and finish_reason == "stop" and client_has_tools
+                        and auto_continues < AUTO_CONTINUE_MAX
+                        and announces_action(round_text)):
+                    auto_continues += 1
+                    log.warning("reply announced an action (or only thought) and stopped without a tool call -- "
+                                "asking the backend to continue (%d/%d)", auto_continues, AUTO_CONTINUE_MAX)
+                    extra_messages += [{"role": "assistant", "content": round_text},
+                                       {"role": "user", "content": "continue"}]
+                    continuation_body = dict(body)
+                    continuation_body["messages"] = body["messages"] + extra_messages
+                    continuation_body["stream"] = True
+                    # A bare "continue" was answered with another lead-in and another stop, so the
+                    # continuation requires a tool call: Basalt writes the call's opening after the thinking.
+                    continuation_body["tool_choice"] = "required"
+                    current_client = httpx.AsyncClient(timeout=None)
+                    cont_req = current_client.build_request(
+                        "POST", f"{backend_url}/v1/chat/completions", json=continuation_body
+                    )
+                    current_resp = await current_client.send(cont_req, stream=True)
+                    if current_resp.status_code >= 400:
+                        await current_resp.aclose()
+                        await current_client.aclose()
+                        for chunk in finish_chunks:
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                        break
+                    if full_text and not full_text[-1].endswith("\n"):
+                        full_text.append("\n\n")
+                        total_len += 2
+                        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': body.get('model'), 'choices': [{'index': 0, 'delta': {'content': chr(10) + chr(10)}, 'finish_reason': None}]})}\n\n"
+                    continue
+
                 if not loop_pattern:
+                    for chunk in finish_chunks:
+                        yield f"data: {json.dumps(chunk)}\n\n"
                     break
 
                 log.warning("repetition loop detected, aborting and re-prompting (attempt %d/%d)",
@@ -1725,9 +1825,20 @@ async def chat_completions(request: Request):
             # is its own task, started first, so it survives that; closing the
             # response stops the backend generating for nobody.
             reply = "".join(full_text).strip()
-            if reply:
+            _log_stream_end(finish_reason, tool_call_parts, reply, tool_rounds, continuations_used, stream_t0,
+                            "".join(full_reasoning), stream_usage)
+            # What the client was handed includes its tool calls: remember them with
+            # the text, whole, so a recalled turn shows the lead-in AND the call that
+            # followed -- not a reply that seems to end at "...now:" with nothing after.
+            client_calls = [p for _, p in sorted(tool_call_parts.items())
+                            if p.get("name") and p.get("name") not in MEMORY_TOOL_NAMES]
+            stored = reply
+            if client_calls:
+                stored = (reply + "\n\n" if reply else "") + "[tool calls]\n" + "\n".join(
+                    f"{p['name']}({p.get('arguments') or ''})" for p in client_calls)
+            if stored:
                 task = asyncio.create_task(
-                    asyncio.to_thread(remember, user_query, reply, "".join(full_reasoning))
+                    asyncio.to_thread(remember, user_query, stored, "".join(full_reasoning))
                 )
                 _background_writes.add(task)
                 task.add_done_callback(_background_writes.discard)
@@ -1737,6 +1848,43 @@ async def chat_completions(request: Request):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_and_capture(), media_type="text/event-stream")
+
+
+STREAM_LOG = os.path.join(LOG_DIR, "stream-ends.jsonl")
+
+
+def _log_stream_end(finish_reason, tool_call_parts, reply, tool_rounds, continuations, t0,
+                    reasoning="", usage=None):
+    """One JSON line per streamed reply: how it ended and what tool calls the client got,
+    so a client that silently stops after a tool call can be matched to its cause
+    (cut off at max_tokens, broken arguments, a call to a tool the client lacks,
+    or a call the backend failed to parse that arrived as plain text)."""
+    try:
+        calls = []
+        for _, p in sorted(tool_call_parts.items()):
+            try:
+                json.loads(p.get("arguments") or "{}")
+                ok = True
+            except json.JSONDecodeError:
+                ok = False
+            calls.append({"name": p.get("name"), "args_chars": len(p.get("arguments") or ""), "args_json_ok": ok,
+                          "ours": p.get("name") in MEMORY_TOOL_NAMES})
+        rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "secs": round(time.time() - t0, 1),
+               "finish": finish_reason, "calls": calls, "memory_rounds": tool_rounds,
+               "loop_continuations": continuations, "reply_chars": len(reply),
+               "call_markup_in_text": any(m in reply for m in ("<tool_call>", "<function=", "</tool_call>")),
+               "reasoning_chars": len(reasoning), "usage": usage or {},
+               "markup_in_reasoning": any(m in reasoning for m in ("<tool_call>", "<function=")),
+               "reply": reply, "reasoning": reasoning}
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(STREAM_LOG, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if finish_reason not in ("stop", "tool_calls") or any(not c["args_json_ok"] or c["ours"] for c in calls) \
+                or rec["call_markup_in_text"]:
+            log.warning("stream ended oddly: finish=%s calls=%s markup_in_text=%s",
+                        finish_reason, calls, rec["call_markup_in_text"])
+    except Exception as e:
+        log.warning("stream-end log failed: %s", e)
 
 
 # --- lifecycle: spawn backend, serve, clean up on exit --------------------
